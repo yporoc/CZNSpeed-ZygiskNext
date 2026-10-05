@@ -119,11 +119,6 @@ static int read_file_head(const char *path, char *out, int cap) {
     return (int)n;
 }
 
-static int read_cmdline(char *out, int cap) {
-    if (read_file_head("/proc/self/cmdline", out, cap) < 0) return -1;
-    return 0;
-}
-
 // main process = many threads; the engine's fork-child watchdog has exactly 1
 static int is_main_process() {
     if (g_is_main_proc >= 0) return g_is_main_proc;
@@ -529,13 +524,18 @@ static void maybe_inject() {
 // ---------------------------------------------------------------- worker
 static void *worker_main(void *) {
     char lib_path[256] = {0};
-    // 1) wait for the engine lib via pure procfs polling (1s, cap 30 min)
-    for (int i = 0; i < 30 * 60; i++) {
+    // 1) wait for libssr.so -- this IS the game filter (only the game has
+    //    this library). 15s early exit for non-game processes.
+    int found = 0;
+    for (int i = 0; i < 15; i++) {
         if (g_state != ST_IDLE) return NULL;
-        if (find_engine_base(&g_engine_base, lib_path, sizeof(lib_path)) == 0) break;
+        if (find_engine_base(&g_engine_base, lib_path, sizeof(lib_path)) == 0) { found = 1; break; }
         sleep(1);
     }
-    if (!g_engine_base) { LOGE("engine lib never appeared; inert exit"); status_write("FAIL: engine lib never appeared"); return NULL; }
+    if (!found) return NULL;
+
+    LOGI("target matched (libssr.so @ %lx)", (unsigned long)g_engine_base);
+    status_write("target matched");
     // 1b) wait for V8 initialization via platform worker threads; arm before
     //     that and Isolate::GetCurrent() hands us garbage (uninitialized TLS)
     int v8_ready = 0;
@@ -639,11 +639,11 @@ static void pre_server(void *, void *) {}
 static void post_server(void *, const void *) {}
 
 static void post_app(void *, const void *) {
-    char pkg[128];
-    if (read_cmdline(pkg, sizeof(pkg)) != 0) return;
-    if (strcmp(pkg, TARGET_PKG) != 0) return;   // every other app: zero footprint
-    LOGI("target matched");
-    status_write("target matched");
+    // Start worker unconditionally -- the worker identifies the game process
+    // by detecting libssr.so in /proc/self/maps, which is reliable on all
+    // Android versions. /proc/self/cmdline is NOT used because setArgV0
+    // timing relative to postAppSpecialize varies across Android versions
+    // (verified: Android 15 matches, Android 17 does not).
     pthread_t tid;
     if (pthread_create(&tid, NULL, worker_main, NULL) == 0)
         pthread_detach(tid);
