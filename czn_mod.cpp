@@ -638,12 +638,97 @@ static void pre_app(void *, void *) {}
 static void pre_server(void *, void *) {}
 static void post_server(void *, const void *) {}
 
-static void post_app(void *, const void *) {
-    // Start worker unconditionally -- the worker identifies the game process
-    // by detecting libssr.so in /proc/self/maps, which is reliable on all
-    // Android versions. /proc/self/cmdline is NOT used because setArgV0
-    // timing relative to postAppSpecialize varies across Android versions
-    // (verified: Android 15 matches, Android 17 does not).
+// ---------------------------------------------------------------- proc gate
+// AppSpecializeArgs is a flat run of pointer-sized slots: its required fields
+// are C++ references (jint&, jstring&), so a struct of pointers over the same
+// prefix is layout-identical. Only slots 0 (uid) and 7 (nice_name) are read --
+// both are "guaranteed to exist on all Android versions" fields.
+struct ArgPrefix {
+    const jint *uid;
+    const jint *gid;
+    const jintArray *gids;
+    const jint *runtime_flags;
+    const jobjectArray *rlimits;
+    const jint *mount_external;
+    const jstring *se_info;
+    const jstring *nice_name;
+};
+static_assert(sizeof(void *) == 8, "gate prefix is LP64; module ships arm64 only");
+
+static const char *const kMainProcs[] = {
+    // intl manifest declares no android:process -> the package name IS the process name
+    "com.smilegate.chaoszero.stove.google",
+    // CN main process only; its four component processes carry no engine lib:
+    // :GP6Service (ACE gshell), :msdk_inner_webview (MSDK webview), :pushservice,
+    // com.lvluo.message (absolute name -- why matching is exact, never a prefix)
+    "com.tencent.czn",
+};
+
+static JNIEnv *g_env = NULL;
+static char g_gate_name[128];
+static const char *g_gate_reason = "none";   // which leg decided, and why
+static int g_gate_appid = -1;                // stays -1 if slot 0 was never read
+
+// 1 = target process, 0 = definitively not, -1 = cannot decide (caller fails open)
+static int gate_decide(const void *cargs) {
+    g_gate_name[0] = 0;
+    g_gate_reason = "none";
+    if (!cargs) { g_gate_reason = "noargs"; return -1; }
+    const ArgPrefix *a = (const ArgPrefix *)cargs;
+    if (!a->uid) { g_gate_reason = "noslot0"; return -1; }
+    g_gate_appid = (int)(*a->uid) % 100000;
+    // webview_zygote (1053), system/shared uids, and the whole isolated family
+    // (90000-98999 from app/webview zygotes, 99000-99999 from the primary zygote)
+    // can never load the game engine. Threshold is 90000, not KernelSU's 99000:
+    // Chrome's sandboxed renderers fork from the webview zygote and land in the
+    // lower band (AOSP Process.isIsolated() covers both).
+    if (g_gate_appid >= 90000) { g_gate_reason = "isolated"; return 0; }
+    if (g_gate_appid < 10000)  { g_gate_reason = "systemuid"; return 0; }
+    if (!a->nice_name) { g_gate_reason = "noslot7"; return -1; }
+    if (!g_env)        { g_gate_reason = "noenv"; return -1; }
+    jstring name = *a->nice_name;
+    if (!name) { g_gate_reason = "nullname"; return -1; }
+    const char *n = g_env->GetStringUTFChars(name, NULL);
+    if (!n) { g_gate_reason = "jni"; return -1; }
+    int len = (int)strlen(n);
+    if (len <= 0 || len >= (int)sizeof(g_gate_name)) {
+        g_env->ReleaseStringUTFChars(name, n);
+        g_gate_reason = "badlen";                 // cannot be a real process name
+        return -1;
+    }
+    snprintf(g_gate_name, sizeof(g_gate_name), "%s", n);
+    int ascii_ok = 1;
+    for (int i = 0; i < len; i++) {               // a wild slot reads back as garbage
+        unsigned char c = (unsigned char)n[i];
+        int ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                 c == '.' || c == '_' || c == ':' || c == '$' || c == '-';
+        if (!ok) { ascii_ok = 0; break; }
+    }
+    int verdict;
+    if (!ascii_ok) {
+        verdict = -1;
+        g_gate_reason = "nonascii";               // slot 7 is not a jstring: ABI assumption broke
+    } else {
+        verdict = 0;
+        for (unsigned i = 0; i < sizeof(kMainProcs) / sizeof(kMainProcs[0]); i++)
+            if (strcmp(n, kMainProcs[i]) == 0) { verdict = 1; break; }
+        g_gate_reason = verdict ? "match" : "nomatch";
+    }
+    g_env->ReleaseStringUTFChars(name, n);
+    return verdict;
+}
+
+static void post_app(void *, const void *cargs) {
+    int v = gate_decide(cargs);
+    if (v == 0) {
+        LOGI("gate=reject reason=%s appid=%d name=%s", g_gate_reason, g_gate_appid,
+             g_gate_name[0] ? g_gate_name : "-");
+        return;                   // no thread, no malloc, no /proc reads, no GOT, no log spam
+    }
+    LOGI("gate=%s reason=%s appid=%d name=%s", v == 1 ? "pass" : "unknown",
+         g_gate_reason, g_gate_appid, g_gate_name[0] ? g_gate_name : "-");
+    // The engine-lib probe in worker_main stays the second, content-level gate:
+    // a matching name is necessary, not sufficient.
     pthread_t tid;
     if (pthread_create(&tid, NULL, worker_main, NULL) == 0)
         pthread_detach(tid);
@@ -651,7 +736,7 @@ static void post_app(void *, const void *) {
 
 extern "C" __attribute__((visibility("default")))
 void zygisk_module_entry(void **table, JNIEnv *env) {
-    (void)env;
+    g_env = env;      // only used inside the specialize callbacks; JNI is valid there
     static ModuleAbi abi;
     abi.api_version = 4;   // v4 ABI: identical module_abi, accepted by all loaders
     abi.impl = (void *)&g_state;
